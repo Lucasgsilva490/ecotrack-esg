@@ -101,7 +101,7 @@ jobs:
   deploy-staging:
     name: Deploy staging
     needs: docker
-    if: needs.docker.outputs.published == 'true'
+    if: needs.docker.outputs.published == 'true' && vars.ENABLE_DEPLOY == 'true'
     runs-on: ubuntu-24.04
     environment: staging
     permissions:
@@ -140,7 +140,7 @@ jobs:
   deploy-production:
     name: Deploy produção
     needs: [docker, deploy-staging]
-    if: needs.docker.outputs.published == 'true'
+    if: needs.docker.outputs.published == 'true' && vars.ENABLE_DEPLOY == 'true'
     runs-on: ubuntu-24.04
     environment: production
     permissions:
