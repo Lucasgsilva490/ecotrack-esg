@@ -1,0 +1,31 @@
+# Configuracao de producao: nenhuma credencial embutida.
+# A conexao com o PostgreSQL vem de variaveis de ambiente (sem valor padrao de proposito:
+# se faltarem, a aplicacao falha com uma mensagem clara em vez de usar credenciais inventadas).
+spring:
+  application:
+    name: ecotrack-esg
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    hikari:
+      connection-timeout: 30000
+  jpa:
+    open-in-view: false
+    hibernate:
+      # "update" cria/ajusta as tabelas automaticamente: suficiente para este MVP academico.
+      # Nunca use create/create-drop em producao (apagam os dados). Em um sistema real, use Flyway/Liquibase.
+      ddl-auto: ${SPRING_JPA_HIBERNATE_DDL_AUTO:update}
+
+server:
+  port: 8080
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never   # o indicador "db" entra no status geral (UP/DOWN) sem expor detalhes

@@ -1,0 +1,10 @@
+# Perfil de testes: H2 em memoria. Nao precisa de PostgreSQL nem de variaveis de ambiente.
+spring:
+  datasource:
+    url: jdbc:h2:mem:ecotrack;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: create-drop

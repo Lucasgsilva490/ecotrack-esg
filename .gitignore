@@ -1,0 +1,21 @@
+# Build
+target/
+*.class
+*.log
+
+# Segredos e configuracao local (NUNCA versionar)
+.env
+deploy/**/.env
+*.pem
+*.key
+id_rsa*
+
+# IDEs / SO
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Maven Wrapper: o script e o .properties DEVEM ser versionados
+!.mvn/wrapper/maven-wrapper.properties

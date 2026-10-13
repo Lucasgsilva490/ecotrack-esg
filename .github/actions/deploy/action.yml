@@ -1,0 +1,158 @@
+name: Deploy via SSH
+description: >
+  Implanta a imagem do GHCR em um servidor Linux via SSH (Docker Compose).
+  Se os secrets obrigatorios nao existirem, NAO faz deploy e registra um aviso explicito
+  (o job nao falha, mas tambem nao finge que implantou).
+
+inputs:
+  environment-name:
+    description: staging ou production
+    required: true
+  image:
+    description: Imagem completa com tag (exemplo - ghcr.io/usuario/repo:sha)
+    required: true
+  app-port:
+    description: Porta publicada no servidor
+    required: true
+  precondition:
+    description: "Use 'false' para pular o deploy (ex.: staging nao foi implantado)"
+    required: false
+    default: "true"
+  ssh-host:
+    required: false
+    default: ""
+  ssh-user:
+    required: false
+    default: ""
+  ssh-private-key:
+    required: false
+    default: ""
+  ssh-port:
+    required: false
+    default: "22"
+  ssh-known-hosts:
+    description: Saida de `ssh-keyscan` do servidor (recomendado). Se vazio, usa ssh-keyscan no momento do deploy.
+    required: false
+    default: ""
+  postgres-password:
+    required: false
+    default: ""
+  postgres-db:
+    required: false
+    default: ecotrack
+  postgres-user:
+    required: false
+    default: ecotrack
+  remote-dir:
+    description: Diretorio no servidor, relativo ao HOME do usuario SSH
+    required: false
+    default: ""
+  ghcr-user:
+    required: true
+  ghcr-token:
+    required: true
+
+outputs:
+  deployed:
+    description: "'true' somente se o deploy foi realizado e a verificacao de saude passou"
+    value: ${{ steps.result.outputs.deployed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verificar configuracao do ambiente
+      id: cfg
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment-name }}
+        SSH_HOST: ${{ inputs.ssh-host }}
+        SSH_USER: ${{ inputs.ssh-user }}
+        SSH_KEY: ${{ inputs.ssh-private-key }}
+        PG_PASS: ${{ inputs.postgres-password }}
+        PRECONDITION: ${{ inputs.precondition }}
+      run: |
+        missing=()
+        [ -n "$SSH_HOST" ] || missing+=("SSH_HOST")
+        [ -n "$SSH_USER" ] || missing+=("SSH_USER")
+        [ -n "$SSH_KEY" ]  || missing+=("SSH_PRIVATE_KEY")
+        [ -n "$PG_PASS" ]  || missing+=("POSTGRES_PASSWORD")
+
+        if [ "$PRECONDITION" != "true" ]; then
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+          echo "::warning title=Deploy $ENV_NAME NAO realizado::Pre-condicao nao atendida (o deploy anterior nao foi realizado)."
+          printf '### ⚠️ Deploy em `%s` NÃO realizado\nO ambiente anterior (staging) não foi implantado, então este deploy foi pulado.\n' "$ENV_NAME" >> "$GITHUB_STEP_SUMMARY"
+        elif [ ${#missing[@]} -gt 0 ]; then
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+          echo "::warning title=Deploy $ENV_NAME NAO realizado::Secrets ausentes no GitHub Environment '$ENV_NAME': ${missing[*]}"
+          printf '### ⚠️ Deploy em `%s` NÃO realizado\nSecrets ausentes no Environment `%s`: **%s**.\nBuild, testes e publicação da imagem não dependem disso. Veja o README (seção de staging e produção).\n' "$ENV_NAME" "$ENV_NAME" "${missing[*]}" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Implantar no servidor
+      if: steps.cfg.outputs.configured == 'true'
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment-name }}
+        IMAGE: ${{ inputs.image }}
+        APP_PORT: ${{ inputs.app-port }}
+        SSH_HOST: ${{ inputs.ssh-host }}
+        SSH_USER: ${{ inputs.ssh-user }}
+        SSH_KEY: ${{ inputs.ssh-private-key }}
+        SSH_PORT: ${{ inputs.ssh-port }}
+        KNOWN_HOSTS: ${{ inputs.ssh-known-hosts }}
+        PG_PASS: ${{ inputs.postgres-password }}
+        PG_DB: ${{ inputs.postgres-db }}
+        PG_USER: ${{ inputs.postgres-user }}
+        REMOTE_DIR_IN: ${{ inputs.remote-dir }}
+        GHCR_USER: ${{ inputs.ghcr-user }}
+        GHCR_TOKEN: ${{ inputs.ghcr-token }}
+      run: |
+        set -euo pipefail
+        SSH_PORT="${SSH_PORT:-22}"
+        REMOTE_DIR="${REMOTE_DIR_IN:-ecotrack/$ENV_NAME}"
+
+        install -m 700 -d ~/.ssh
+        ( umask 077; printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key )
+        if [ -n "$KNOWN_HOSTS" ]; then
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+        else
+          echo "::warning::SSH_KNOWN_HOSTS nao definido; usando ssh-keyscan (confia na primeira chave recebida)."
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null
+        fi
+
+        SSH_OPTS=(-i ~/.ssh/deploy_key -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20)
+        REMOTE="$SSH_USER@$SSH_HOST"
+
+        ssh "${SSH_OPTS[@]}" "$REMOTE" "mkdir -p '$REMOTE_DIR'"
+        scp -P "$SSH_PORT" -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          deploy/docker-compose.yml deploy/remote-deploy.sh "$REMOTE:$REMOTE_DIR/"
+
+        # .env do ambiente, enviado por stdin (a senha nunca aparece em argumentos de comando)
+        {
+          printf "APP_IMAGE='%s'\n" "$IMAGE"
+          printf "APP_PORT='%s'\n" "$APP_PORT"
+          printf "POSTGRES_DB='%s'\n" "$PG_DB"
+          printf "POSTGRES_USER='%s'\n" "$PG_USER"
+          printf "POSTGRES_PASSWORD='%s'\n" "$PG_PASS"
+        } | ssh "${SSH_OPTS[@]}" "$REMOTE" "umask 077; cat > '$REMOTE_DIR/.env'"
+
+        printf '%s' "$GHCR_TOKEN" | ssh "${SSH_OPTS[@]}" "$REMOTE" "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+
+        rc=0
+        ssh "${SSH_OPTS[@]}" "$REMOTE" "cd '$REMOTE_DIR' && bash remote-deploy.sh '$ENV_NAME' '$APP_PORT'" || rc=$?
+        ssh "${SSH_OPTS[@]}" "$REMOTE" "docker logout ghcr.io" || true
+        rm -f ~/.ssh/deploy_key
+        exit "$rc"
+
+    - name: Registrar resultado
+      id: result
+      if: steps.cfg.outputs.configured == 'true'
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment-name }}
+        IMAGE: ${{ inputs.image }}
+        APP_PORT: ${{ inputs.app-port }}
+      run: |
+        echo "deployed=true" >> "$GITHUB_OUTPUT"
+        printf '### ✅ Deploy em `%s` realizado\nImagem: `%s`\nPorta publicada no servidor: `%s` (`/actuator/health` retornou UP)\n' "$ENV_NAME" "$IMAGE" "$APP_PORT" >> "$GITHUB_STEP_SUMMARY"

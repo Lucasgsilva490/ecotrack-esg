@@ -1,0 +1,175 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1) CI: build + testes (nao usa nenhum secret)
+  # ---------------------------------------------------------------
+  build-test:
+    name: Build e testes
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@v4.5.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build e testes (mvnw clean verify)
+        run: |
+          chmod +x mvnw
+          ./mvnw -B clean verify
+
+      - name: Publicar relatórios de teste
+        if: always()
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------
+  # 2) Imagem Docker: sempre builda; so publica no GHCR em push/manual na main
+  # ---------------------------------------------------------------
+  docker:
+    name: Imagem Docker
+    needs: build-test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+      published: ${{ steps.meta.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Definir nome e tag da imagem
+        id: meta
+        run: |
+          # GHCR exige nome em minusculas
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configurar Buildx
+        uses: docker/setup-buildx-action@v3.7.1
+
+      - name: Login no GHCR
+        if: steps.meta.outputs.publish == 'true'
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (e push, quando autorizado)
+        uses: docker/build-push-action@v6.9.0
+        with:
+          context: .
+          push: ${{ steps.meta.outputs.publish == 'true' }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+
+  # ---------------------------------------------------------------
+  # 3) Deploy em staging (automatico apos publicar a imagem)
+  # ---------------------------------------------------------------
+  deploy-staging:
+    name: Deploy staging
+    needs: docker
+    if: needs.docker.outputs.published == 'true'
+    runs-on: ubuntu-24.04
+    environment: staging
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    outputs:
+      deployed: ${{ steps.deploy.outputs.deployed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Deploy
+        id: deploy
+        uses: ./.github/actions/deploy
+        with:
+          environment-name: staging
+          image: ${{ needs.docker.outputs.image }}:${{ needs.docker.outputs.tag }}
+          app-port: ${{ vars.APP_PORT || '8081' }}
+          ssh-host: ${{ secrets.SSH_HOST }}
+          ssh-user: ${{ secrets.SSH_USER }}
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          ssh-port: ${{ secrets.SSH_PORT || '22' }}
+          ssh-known-hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
+          postgres-password: ${{ secrets.POSTGRES_PASSWORD }}
+          postgres-db: ${{ vars.POSTGRES_DB || 'ecotrack_staging' }}
+          postgres-user: ${{ vars.POSTGRES_USER || 'ecotrack' }}
+          ghcr-user: ${{ github.actor }}
+          ghcr-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------
+  # 4) Deploy em producao (apos staging; proteja o Environment com aprovacao manual)
+  # ---------------------------------------------------------------
+  deploy-production:
+    name: Deploy produção
+    needs: [docker, deploy-staging]
+    if: needs.docker.outputs.published == 'true'
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    outputs:
+      deployed: ${{ steps.deploy.outputs.deployed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Deploy
+        id: deploy
+        uses: ./.github/actions/deploy
+        with:
+          environment-name: production
+          precondition: ${{ needs.deploy-staging.outputs.deployed == 'true' }}
+          image: ${{ needs.docker.outputs.image }}:${{ needs.docker.outputs.tag }}
+          app-port: ${{ vars.APP_PORT || '8080' }}
+          ssh-host: ${{ secrets.SSH_HOST }}
+          ssh-user: ${{ secrets.SSH_USER }}
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          ssh-port: ${{ secrets.SSH_PORT || '22' }}
+          ssh-known-hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
+          postgres-password: ${{ secrets.POSTGRES_PASSWORD }}
+          postgres-db: ${{ vars.POSTGRES_DB || 'ecotrack_production' }}
+          postgres-user: ${{ vars.POSTGRES_USER || 'ecotrack' }}
+          ghcr-user: ${{ github.actor }}
+          ghcr-token: ${{ secrets.GITHUB_TOKEN }}
